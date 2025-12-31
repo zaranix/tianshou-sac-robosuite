@@ -12,8 +12,6 @@ import gymnasium as gym
 
 from gymnasium import spaces
 
-from gymnasium.wrappers import NormalizeReward, TransformReward
-
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -127,7 +125,9 @@ def make_robosuite_env(task_name, seed=0, training=True, video_record=False):
 
         has_renderer=False,
 
-        reward_shaping=True, 
+        reward_shaping=True,
+
+        reward_scale=1.0,      # Scale factor for reward normalization
 
         control_freq=20,
 
@@ -149,19 +149,11 @@ def make_robosuite_env(task_name, seed=0, training=True, video_record=False):
 
 
 
-    # 4. Reward Normalization (CRITICAL FIX)
+    # 4. Reward Handling
 
-    # We only normalize rewards during training. 
+    # Environment handles reward scaling with reward_scale=1.0
 
-    # For testing, we want the RAW score to see if it actually solved the task.
-
-    if training:
-
-        env = NormalizeReward(env)
-
-        # Clip reward to prevent instability
-
-        env = TransformReward(env, lambda r: np.clip(r, -10.0, 10.0))
+    # No clipping or normalization wrappers needed
 
 
 
