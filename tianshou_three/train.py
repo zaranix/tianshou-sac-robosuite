@@ -253,19 +253,27 @@ def get_args():
 
 # =============================================================================
 
+def _make_train_env(task_name):
+    """Factory function to avoid lambda closure issues in SubprocVectorEnv."""
+    return make_robosuite_env(task_name, training=True)
+
+def _make_test_env(task_name):
+    """Factory function to avoid lambda closure issues in SubprocVectorEnv."""
+    return make_robosuite_env(task_name, training=False)
+
 def train_sac(args):
 
     # Note: We pass training=True/False to apply Reward Normalization correctly
 
     train_envs = SubprocVectorEnv(
 
-        [lambda: make_robosuite_env(args.task, training=True) for _ in range(args.training_num)]
+        [lambda task=args.task: _make_train_env(task) for _ in range(args.training_num)]
 
     )
 
     test_envs = SubprocVectorEnv(
 
-        [lambda: make_robosuite_env(args.task, training=False) for _ in range(args.test_num)]
+        [lambda task=args.task: _make_test_env(task) for _ in range(args.test_num)]
 
     )
 
@@ -451,7 +459,7 @@ def train_sac(args):
 
         logger=logger,
 
-        stop_fn=lambda mean_reward: mean_reward >= 500,
+        stop_fn=lambda mean_reward: mean_reward >= 150,
 
     ).run()
 
