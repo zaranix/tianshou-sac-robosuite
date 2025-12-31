@@ -12,7 +12,7 @@ import gymnasium as gym
 
 from gymnasium import spaces
 
-from gymnasium.wrappers import TransformReward
+from gymnasium.wrappers import NormalizeReward, TransformReward
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -149,15 +149,19 @@ def make_robosuite_env(task_name, seed=0, training=True, video_record=False):
 
 
 
-    # 4. Reward Clipping (Option A: Light clipping only, no normalization)
+    # 4. Reward Normalization (CRITICAL FIX)
 
-    # SAC is entropy-regularized and handles reward scale well.
+    # We only normalize rewards during training. 
 
-    # Light clipping prevents extreme outliers but preserves actual reward signal.
+    # For testing, we want the RAW score to see if it actually solved the task.
 
-    # This removes train/test reward domain gap and makes TensorBoard interpretable.
+    if training:
 
-    env = TransformReward(env, lambda r: np.clip(r, -1.0, 1.0))
+        env = NormalizeReward(env)
+
+        # Clip reward to prevent instability
+
+        env = TransformReward(env, lambda r: np.clip(r, -10.0, 10.0))
 
 
 
