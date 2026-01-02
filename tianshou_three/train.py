@@ -12,7 +12,7 @@ import gymnasium as gym
 
 from gymnasium import spaces
 
-from gymnasium.wrappers import NormalizeReward, TransformReward
+from gymnasium.wrappers import NormalizeReward, TransformReward, TransformObservation
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -42,66 +42,9 @@ from tianshou.utils.net.continuous import ActorProb, Critic
 
 # =============================================================================
 
-# 1. Custom Robosuite Wrapper (FIXED)
+# 1. Environment Factory
 
 # =============================================================================
-
-class TianshouRobosuiteWrapper(gym.Wrapper):
-
-    """
-
-    Wraps Robosuite to be fully compatible with Gymnasium and Tianshou.
-
-    Casts all observations to Float32.
-
-    """
-
-    def __init__(self, env):
-
-        super().__init__(env)
-
-        assert isinstance(env.observation_space, spaces.Box), \
-            "Environment must be wrapped with robosuite.wrappers.GymWrapper first."
-
-
-
-        self.observation_space = spaces.Box(
-
-            low=env.observation_space.low,
-
-            high=env.observation_space.high,
-
-            dtype=np.float32
-
-        )
-
-        self.action_space = spaces.Box(
-
-            low=env.action_space.low,
-
-            high=env.action_space.high,
-
-            dtype=np.float32
-
-        )
-
-
-
-    def reset(self, seed=None, options=None):
-
-        obs, info = self.env.reset(seed=seed, options=options)
-
-        return obs.astype(np.float32), info
-
-
-
-    def step(self, action):
-
-        obs, reward, terminated, truncated, info = self.env.step(action)
-
-        return obs.astype(np.float32), reward, terminated, truncated, info
-
-
 
 def make_robosuite_env(task_name, seed=0, training=True, video_record=False):
 
@@ -143,9 +86,27 @@ def make_robosuite_env(task_name, seed=0, training=True, video_record=False):
 
     
 
-    # 3. Type Casting
+    # 3. Type Casting (using modern Gymnasium wrapper)
 
-    env = TianshouRobosuiteWrapper(env)
+    env = TransformObservation(
+
+        env,
+
+        lambda obs: obs.astype(np.float32),
+
+        observation_space = spaces.Box(
+
+            low=env.observation_space.low,
+
+            high=env.observation_space.high,
+
+            dtype=np.float32
+
+        )
+
+    )
+
+
 
 
 
@@ -515,7 +476,23 @@ def watch_sac(args):
 
     vis_env = GymWrapper(vis_env, keys=keys)
 
-    vis_env = TianshouRobosuiteWrapper(vis_env)
+    vis_env = TransformObservation(
+
+        vis_env,
+
+        lambda obs: obs.astype(np.float32),
+
+        spaces.Box(
+
+            low=vis_env.observation_space.low,
+
+            high=vis_env.observation_space.high,
+
+            dtype=np.float32
+
+        )
+
+    )
 
     
 
