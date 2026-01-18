@@ -108,18 +108,19 @@ def main():
         tau=0.005,
         train_freq=1,
         gradient_steps=1,
+        tensorboard_log="tb_logs", 
     )
 
     callback = SuccessEvalCallback(
         eval_env=eval_env,
-        eval_episodes=20,
-        eval_freq=20000,
+        eval_episodes=50,
+        eval_freq=50000,
         save_path="checkpoints",
         verbose=1,
     )
 
-    total_steps = 200_000  # start with 200k; increase later
-    model.learn(total_timesteps=total_steps, callback=callback)
+    total_steps = 1_000_000
+    model.learn(total_timesteps=total_steps, callback=callback, tb_log_name="sac_lift_baseline")
 
     final_path = os.path.join("checkpoints", "final_sb3")
     model.save(final_path)
