@@ -119,7 +119,7 @@ def main():
         verbose=1,
     )
 
-    total_steps = 1_000_000
+    total_steps = 2_000_000
     model.learn(total_timesteps=total_steps, callback=callback, tb_log_name="sac_lift_baseline")
 
     final_path = os.path.join("checkpoints", "final_sb3")
