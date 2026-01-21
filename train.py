@@ -1,18 +1,12 @@
-# train_sb3_sac_lift_repro.py
+# train_sb3_sac_lift_repro_spurious.py
 # Reproducible + resume-safe SAC baseline on Robosuite Lift (SB3)
-# - Fixed seeds
-# - Unique run directory (no overwriting)
-# - Periodic checkpoints (GPU interruption safe)
-# - Best checkpoint by success-rate
-# - Saves config.json + versions.txt
-# - TensorBoard logs per run
+# + optional spurious correlation: cube color <-> cube x-position
 
 import os
 import json
-import time
 import random
 import datetime
-from typing import Optional, Dict, Any, Tuple, Union, List
+from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 import torch
@@ -25,6 +19,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
 from success import SuccessInfoWrapper  # must provide info["success"] in step()
+from spurious_lift import SpuriousColorPositionLiftWrapper  # your wrapper file
 
 
 # -----------------------------
@@ -66,11 +61,15 @@ def make_env(
     horizon: int = 300,
     control_freq: int = 20,
     reward_shaping: bool = True,
+    spurious_mode: str = "none",   # <-- NEW
+    spurious_seed: Optional[int] = None,  # <-- NEW (for wrapper randomness)
 ) -> Monitor:
     """
-    Returns a Gymnasium-style env for SB3:
-      reset() -> (obs, info)
-      step()  -> (obs, reward, terminated, truncated, info)
+    spurious_mode:
+      - "none": normal Lift
+      - "confounded": color and x-position are correlated
+      - "shifted_indep": break correlation (color independent of position)
+      - "shifted_swapped": reverse mapping (also breaks)
     """
     env = suite.make(
         env_name="Lift",
@@ -83,12 +82,20 @@ def make_env(
         reward_shaping=reward_shaping,
     )
 
+    # Gymnasium API
     env = GymWrapper(env)
+
+    # Inject spurious correlation right after GymWrapper
+    if spurious_mode != "none":
+        if spurious_seed is None:
+            spurious_seed = 0 if seed is None else seed
+        env = SpuriousColorPositionLiftWrapper(env, mode=spurious_mode, seed=spurious_seed)
+
+    # Success + monitor
     env = SuccessInfoWrapper(env)  # adds info["success"] (0/1)
     env = Monitor(env)
 
     if seed is not None:
-        # Gymnasium seeding
         env.reset(seed=seed)
         env.action_space.seed(seed)
 
@@ -109,7 +116,7 @@ class SuccessEvalCallback(BaseCallback):
     """
     Evaluates success rate every eval_freq steps on eval_env,
     saves best model by success rate into save_dir/best_by_success.zip
-    Also logs to TensorBoard: eval/success_rate
+    Logs to TensorBoard: eval/success_rate
     """
 
     def __init__(
@@ -144,11 +151,9 @@ class SuccessEvalCallback(BaseCallback):
         return float(succ / self.eval_episodes)
 
     def _on_step(self) -> bool:
-        # avoid eval at step 0
         if self.num_timesteps > 0 and (self.num_timesteps % self.eval_freq == 0):
             sr = self._evaluate()
 
-            # TensorBoard logging (SB3 logger)
             try:
                 self.logger.record("eval/success_rate", sr)
             except Exception:
@@ -178,12 +183,21 @@ def eval_success_rate(
     horizon: int = 300,
     control_freq: int = 20,
     reward_shaping: bool = True,
+    spurious_mode: str = "none",      # <-- NEW
+    spurious_seed: int = 0,           # <-- NEW
 ) -> float:
-    env = make_env(seed=seed, horizon=horizon, control_freq=control_freq, reward_shaping=reward_shaping)
+    env = make_env(
+        seed=seed,
+        horizon=horizon,
+        control_freq=control_freq,
+        reward_shaping=reward_shaping,
+        spurious_mode=spurious_mode,
+        spurious_seed=spurious_seed,
+    )
 
     succ = 0.0
     for ep in range(int(episodes)):
-        obs, info = env.reset(seed=seed + 10_000 + ep)  # vary eval seeds per episode
+        obs, info = env.reset(seed=seed + 10_000 + ep)
         done = False
         ep_succ = 0.0
         while not done:
@@ -210,11 +224,15 @@ def main():
     control_freq = 20
     reward_shaping = True
 
+    # Spurious protocol (THIS is what you change for confounded training)
+    train_spurious_mode = "confounded"   # <-- set "none" for normal baseline
+    eval_spurious_mode = "confounded"    # <-- nominal eval matches training
+
     # Eval protocol
     eval_freq = 50_000
     eval_episodes = 50
 
-    # SAC hyperparams (keep fixed unless you intentionally change)
+    # SAC hyperparams
     sac_kwargs: Dict[str, Any] = dict(
         learning_rate=3e-4,
         buffer_size=1_000_000,
@@ -230,9 +248,8 @@ def main():
 
     set_global_seed(seed)
 
-    # Unique run directory (no overwriting)
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_id = f"Lift_SAC_SB3_seed{seed}_h{horizon}_steps{total_steps}_{timestamp}"
+    run_id = f"Lift_SAC_SB3_seed{seed}_h{horizon}_steps{total_steps}_{train_spurious_mode}_{timestamp}"
     run_dir = os.path.join("runs", run_id)
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     tb_dir = os.path.join(run_dir, "tb_logs")
@@ -240,14 +257,29 @@ def main():
     ensure_dir(ckpt_dir)
     ensure_dir(tb_dir)
 
-    # Create envs
-    train_env = make_env(seed=seed, horizon=horizon, control_freq=control_freq, reward_shaping=reward_shaping)
-    eval_env = make_env(seed=seed + 1, horizon=horizon, control_freq=control_freq, reward_shaping=reward_shaping)
+    # Create envs (train + eval)
+    train_env = make_env(
+        seed=seed,
+        horizon=horizon,
+        control_freq=control_freq,
+        reward_shaping=reward_shaping,
+        spurious_mode=train_spurious_mode,
+        spurious_seed=seed,
+    )
+
+    eval_env = make_env(
+        seed=seed + 1,
+        horizon=horizon,
+        control_freq=control_freq,
+        reward_shaping=reward_shaping,
+        spurious_mode=eval_spurious_mode,
+        spurious_seed=seed + 1,
+    )
 
     obs_dim, act_dim = get_obs_act_dims(train_env)
     print("obs_dim:", obs_dim, "act_dim:", act_dim)
 
-    # Save config + versions for reproducibility
+    # Save config + versions
     config = {
         "run_id": run_id,
         "seed": seed,
@@ -260,11 +292,13 @@ def main():
             "horizon": horizon,
             "control_freq": control_freq,
             "reward_shaping": reward_shaping,
+            "train_spurious_mode": train_spurious_mode,
+            "eval_spurious_mode": eval_spurious_mode,
         },
         "algo": {"name": "SAC", "library": "stable-baselines3", **sac_kwargs},
         "eval": {"eval_freq": eval_freq, "eval_episodes": eval_episodes, "report_eval_episodes": 500},
         "paths": {"run_dir": run_dir, "ckpt_dir": ckpt_dir, "tb_dir": tb_dir},
-        "notes": "Best checkpoint selected by eval success rate (max_t info['success']). Periodic checkpoints enabled.",
+        "notes": "Spurious correlation injected via SpuriousColorPositionLiftWrapper. Best checkpoint selected by eval success.",
     }
 
     with open(os.path.join(run_dir, "config.json"), "w") as f:
@@ -281,8 +315,7 @@ def main():
         **sac_kwargs,
     )
 
-    # Callbacks:
-    # 1) best-by-success
+    # Callbacks
     best_cb = SuccessEvalCallback(
         eval_env=eval_env,
         eval_episodes=eval_episodes,
@@ -290,12 +323,12 @@ def main():
         save_dir=ckpt_dir,
         verbose=1,
     )
-    # 2) periodic checkpoints (for GPU interruption safety)
+
     periodic_cb = CheckpointCallback(
-        save_freq=eval_freq,  # same cadence as eval; change to 25_000 if you want more frequent
+        save_freq=eval_freq,
         save_path=ckpt_dir,
         name_prefix="ckpt",
-        save_replay_buffer=False,  # keep False unless you implement replay buffer saving explicitly
+        save_replay_buffer=False,
         save_vecnormalize=False,
     )
 
@@ -307,25 +340,55 @@ def main():
     model.save(final_path)
     print(f"✅ Saved final checkpoint: {final_path}.zip")
 
-    # Report evaluation (use BEST checkpoint for reporting!)
+    # Evaluate best checkpoint on nominal + shifted envs
     best_path = os.path.join(ckpt_dir, "best_by_success.zip")
     if os.path.exists(best_path):
         best_model = SAC.load(best_path)
-        sr500 = eval_success_rate(
+
+        sr_nominal = eval_success_rate(
             best_model,
             episodes=500,
             seed=seed + 999,
             horizon=horizon,
             control_freq=control_freq,
             reward_shaping=reward_shaping,
+            spurious_mode=train_spurious_mode,   # nominal = training mode
+            spurious_seed=seed + 999,
         )
-        print(f"✅ Best checkpoint success_rate over 500 eps: {sr500:.3f}")
+
+        sr_shift_indep = eval_success_rate(
+            best_model,
+            episodes=500,
+            seed=seed + 1999,
+            horizon=horizon,
+            control_freq=control_freq,
+            reward_shaping=reward_shaping,
+            spurious_mode="shifted_indep",
+            spurious_seed=seed + 1999,
+        )
+
+        sr_shift_swapped = eval_success_rate(
+            best_model,
+            episodes=500,
+            seed=seed + 2999,
+            horizon=horizon,
+            control_freq=control_freq,
+            reward_shaping=reward_shaping,
+            spurious_mode="shifted_swapped",
+            spurious_seed=seed + 2999,
+        )
+
+        print(f"✅ Best checkpoint SR500 nominal({train_spurious_mode}) = {sr_nominal:.3f}")
+        print(f"✅ Best checkpoint SR500 shifted_indep            = {sr_shift_indep:.3f}")
+        print(f"✅ Best checkpoint SR500 shifted_swapped          = {sr_shift_swapped:.3f}")
 
         with open(os.path.join(run_dir, "eval_report.txt"), "w") as f:
             f.write(f"Best checkpoint: {best_path}\n")
-            f.write(f"SR over 500 eps: {sr500:.6f}\n")
+            f.write(f"SR500 nominal({train_spurious_mode}): {sr_nominal:.6f}\n")
+            f.write(f"SR500 shifted_indep: {sr_shift_indep:.6f}\n")
+            f.write(f"SR500 shifted_swapped: {sr_shift_swapped:.6f}\n")
     else:
-        print("⚠️ Could not find best_by_success.zip to evaluate. (Did callback save correctly?)")
+        print("⚠️ Could not find best_by_success.zip to evaluate.")
 
     # Clean up
     train_env.close()
