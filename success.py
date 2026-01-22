@@ -30,4 +30,3 @@ class SuccessInfoWrapper(gym.Wrapper):
         info = dict(info)
         info["success"] = self._check_success_robosuite()
         return obs, reward, terminated, truncated, info
-
