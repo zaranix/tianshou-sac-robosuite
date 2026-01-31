@@ -1,7 +1,9 @@
-# train_sb3_sac_lift_repro_nominal_confounded.py
-# Same as your working baseline, but:
-#  - nominal spurious correlation (pos <-> color) like the paper
-#  - append RGB (3 dims) to state so agent can learn the color correlation
+# train.py
+# Reproducible + resume-safe SAC baseline on Robosuite Lift (SB3)
+# + OPTIONAL nominal confounded env (paper-like): left->green, right->red
+#   - state-based obs (use_camera_obs=False)
+#   - appends RGB (3 dims) to obs so the agent can "see" color without pixels
+#   - forces OSC_POSITION controller so action_dim should be 4 (paper-like)
 
 import os
 import json
@@ -19,8 +21,7 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
-from success import SuccessInfoWrapper
-from spurious_lift import NominalColorPosToStateWrapper  # <-- NEW
+from success import SuccessInfoWrapper  # adds info["success"] using robosuite _check_success()
 
 
 # -----------------------------
@@ -62,26 +63,58 @@ def make_env(
     horizon: int = 300,
     control_freq: int = 20,
     reward_shaping: bool = True,
-    spurious_seed: Optional[int] = None,  # <-- NEW
+    nominal_confounded: bool = False,  # if True: left->green, right->red + RGB appended
+    spurious_seed: int = 0,            # randomness for confounder sampling
 ) -> Monitor:
+    """
+    Returns a Gymnasium-style env for SB3:
+      reset() -> (obs, info)
+      step()  -> (obs, reward, terminated, truncated, info)
+
+    Key points:
+      - uses OSC_POSITION controller -> action_dim should be 4
+      - state-based obs (use_camera_obs=False)
+      - optional: inject nominal spurious correlation (pos<->color) and append RGB to obs
+    """
+    # ✅ Force OSC_POSITION (paper-like); if this isn't applied you'll get act_dim=7
+    # Load BASIC controller and modify to use OSC_POSITION (3D position control only)
+    from robosuite.controllers import load_composite_controller_config
+    
+    controller_cfg = load_composite_controller_config(controller="BASIC", robot="Panda")
+    # Modify the right arm controller from OSC_POSE (6D) to OSC_POSITION (3D)
+    controller_cfg["body_parts"]["right"]["type"] = "OSC_POSITION"
+    controller_cfg["body_parts"]["right"]["output_max"] = [0.05, 0.05, 0.05]
+    controller_cfg["body_parts"]["right"]["output_min"] = [-0.05, -0.05, -0.05]
+    # Remove orientation-related keys that aren't needed for OSC_POSITION
+    controller_cfg["body_parts"]["right"].pop("orientation_limits", None)
+    controller_cfg["body_parts"]["right"].pop("uncouple_pos_ori", None)
+
     env = suite.make(
         env_name="Lift",
         robots="Panda",
+        controller_configs=controller_cfg,
         has_renderer=False,
         has_offscreen_renderer=False,
-        use_camera_obs=False,  # state-based
+        use_camera_obs=False,  # state obs
         control_freq=control_freq,
         horizon=horizon,
         reward_shaping=reward_shaping,
     )
 
+    # ✅ Inject spurious correlation at robosuite level BEFORE GymWrapper
+    if nominal_confounded:
+        from spurious_lift import RobosuiteColorPosWrapper
+        env = RobosuiteColorPosWrapper(env, mode="confounded", seed=spurious_seed)
+
+    # Convert to Gymnasium
     env = GymWrapper(env)
 
-    # NEW: nominal spurious correlation + add RGB to state
-    if spurious_seed is None:
-        spurious_seed = 0 if seed is None else int(seed)
-    env = NominalColorPosToStateWrapper(env, seed=spurious_seed)
+    # ✅ Append RGB to obs so agent can use color without pixels
+    if nominal_confounded:
+        from spurious_lift import AppendRGBObsWrapper
+        env = AppendRGBObsWrapper(env)
 
+    # success metric + monitor (same as your working baseline)
     env = SuccessInfoWrapper(env)
     env = Monitor(env)
 
@@ -103,7 +136,20 @@ def get_obs_act_dims(env) -> Tuple[int, int]:
 # Evaluation callback (best by success)
 # -----------------------------
 class SuccessEvalCallback(BaseCallback):
-    def __init__(self, eval_env, eval_episodes: int = 50, eval_freq: int = 50_000, save_dir: str = "checkpoints", verbose: int = 1):
+    """
+    Evaluates success rate every eval_freq steps on eval_env,
+    saves best model by success rate into save_dir/best_by_success.zip
+    Logs to TensorBoard: eval/success_rate
+    """
+
+    def __init__(
+        self,
+        eval_env,
+        eval_episodes: int = 50,
+        eval_freq: int = 50_000,
+        save_dir: str = "checkpoints",
+        verbose: int = 1,
+    ):
         super().__init__(verbose)
         self.eval_env = eval_env
         self.eval_episodes = int(eval_episodes)
@@ -129,6 +175,7 @@ class SuccessEvalCallback(BaseCallback):
     def _on_step(self) -> bool:
         if self.num_timesteps > 0 and (self.num_timesteps % self.eval_freq == 0):
             sr = self._evaluate()
+
             try:
                 self.logger.record("eval/success_rate", sr)
             except Exception:
@@ -143,9 +190,13 @@ class SuccessEvalCallback(BaseCallback):
                 self.model.save(best_path)
                 if self.verbose:
                     print(f"✅ Saved best checkpoint: {best_path}.zip (sr={sr:.3f})")
+
         return True
 
 
+# -----------------------------
+# Offline evaluation (for reporting)
+# -----------------------------
 def eval_success_rate(
     model: SAC,
     *,
@@ -154,8 +205,17 @@ def eval_success_rate(
     horizon: int = 300,
     control_freq: int = 20,
     reward_shaping: bool = True,
+    nominal_confounded: bool = False,
+    spurious_seed: int = 0,
 ) -> float:
-    env = make_env(seed=seed, horizon=horizon, control_freq=control_freq, reward_shaping=reward_shaping, spurious_seed=seed)
+    env = make_env(
+        seed=seed,
+        horizon=horizon,
+        control_freq=control_freq,
+        reward_shaping=reward_shaping,
+        nominal_confounded=nominal_confounded,
+        spurious_seed=spurious_seed,
+    )
 
     succ = 0.0
     for ep in range(int(episodes)):
@@ -173,46 +233,84 @@ def eval_success_rate(
     return float(succ / episodes)
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main():
+    # ======== EXPERIMENT SETTINGS ========
     seed = 0
 
-    # Paper Lift: horizon=300, control_freq=20, max training steps=1e6 :contentReference[oaicite:2]{index=2}
-    total_steps = 1_000_000
+    # For nominal-confounded run (paper Figure 11 col 1): set True
+    nominal_confounded = True
+
+    # Steps: start with 2M (your baseline got ~0.998 at 2M)
+    total_steps = 2_000_000
+
+    # Env protocol
     horizon = 300
     control_freq = 20
     reward_shaping = True
 
+    # Eval protocol
     eval_freq = 50_000
     eval_episodes = 50
 
+    # SAC hyperparams (same as your working baseline)
     sac_kwargs: Dict[str, Any] = dict(
         learning_rate=3e-4,
         buffer_size=1_000_000,
         learning_starts=10_000,
-        batch_size=256,  # (paper used 128, but keep your baseline unchanged for now)
+        batch_size=256,
         gamma=0.99,
         tau=0.005,
         train_freq=1,
         gradient_steps=1,
         verbose=1,
     )
+    # ===================================
 
     set_global_seed(seed)
 
+    # Unique run directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_id = f"Lift_SAC_SB3_seed{seed}_h{horizon}_steps{total_steps}_NOMINAL_CONF_{timestamp}"
+    tag = "NOMINAL_CONF" if nominal_confounded else "BASE"
+    run_id = f"Lift_SAC_SB3_seed{seed}_h{horizon}_steps{total_steps}_{tag}_{timestamp}"
     run_dir = os.path.join("runs", run_id)
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     tb_dir = os.path.join(run_dir, "tb_logs")
+
     ensure_dir(ckpt_dir)
     ensure_dir(tb_dir)
 
-    train_env = make_env(seed=seed, horizon=horizon, control_freq=control_freq, reward_shaping=reward_shaping, spurious_seed=seed)
-    eval_env  = make_env(seed=seed + 1, horizon=horizon, control_freq=control_freq, reward_shaping=reward_shaping, spurious_seed=seed + 1)
+    # Create envs
+    train_env = make_env(
+        seed=seed,
+        horizon=horizon,
+        control_freq=control_freq,
+        reward_shaping=reward_shaping,
+        nominal_confounded=nominal_confounded,
+        spurious_seed=seed,
+    )
+    eval_env = make_env(
+        seed=seed + 1,
+        horizon=horizon,
+        control_freq=control_freq,
+        reward_shaping=reward_shaping,
+        nominal_confounded=nominal_confounded,
+        spurious_seed=seed + 1,
+    )
 
     obs_dim, act_dim = get_obs_act_dims(train_env)
-    print("obs_dim:", obs_dim, "act_dim:", act_dim)  # expect obs_dim ~= 50
+    print("obs_dim:", obs_dim, "act_dim:", act_dim)
 
+    # HARD GUARD: if controller isn't applied, abort
+    if act_dim != 4:
+        raise RuntimeError(
+            f"Expected action_dim=4 for OSC_POSITION, but got {act_dim}. "
+            "Controller config not applied correctly."
+        )
+
+    # Save config + versions
     config = {
         "run_id": run_id,
         "seed": seed,
@@ -220,43 +318,81 @@ def main():
         "env": {
             "task": "Lift",
             "robot": "Panda",
+            "controller": "OSC_POSITION",
             "obs": f"state({obs_dim})",
             "action_dim": act_dim,
             "horizon": horizon,
             "control_freq": control_freq,
             "reward_shaping": reward_shaping,
-            "nominal_spurious": "left->green, right->red, RGB appended to obs",
+            "nominal_spurious": (
+                "left->green, right->red; RGB appended to obs" if nominal_confounded else "none"
+            ),
         },
         "algo": {"name": "SAC", "library": "stable-baselines3", **sac_kwargs},
         "eval": {"eval_freq": eval_freq, "eval_episodes": eval_episodes, "report_eval_episodes": 500},
         "paths": {"run_dir": run_dir, "ckpt_dir": ckpt_dir, "tb_dir": tb_dir},
+        "notes": "Best checkpoint selected by eval success rate (max_t info['success']). Periodic checkpoints enabled.",
     }
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
+
     write_versions(os.path.join(run_dir, "versions.txt"))
 
-    model = SAC("MlpPolicy", train_env, seed=seed, tensorboard_log=tb_dir, **sac_kwargs)
+    # Build model
+    model = SAC(
+        "MlpPolicy",
+        train_env,
+        seed=seed,
+        tensorboard_log=tb_dir,
+        **sac_kwargs,
+    )
 
-    best_cb = SuccessEvalCallback(eval_env=eval_env, eval_episodes=eval_episodes, eval_freq=eval_freq, save_dir=ckpt_dir, verbose=1)
-    periodic_cb = CheckpointCallback(save_freq=eval_freq, save_path=ckpt_dir, name_prefix="ckpt", save_replay_buffer=False, save_vecnormalize=False)
+    # Callbacks
+    best_cb = SuccessEvalCallback(
+        eval_env=eval_env,
+        eval_episodes=eval_episodes,
+        eval_freq=eval_freq,
+        save_dir=ckpt_dir,
+        verbose=1,
+    )
 
+    periodic_cb = CheckpointCallback(
+        save_freq=eval_freq,
+        save_path=ckpt_dir,
+        name_prefix="ckpt",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
+    )
+
+    # Train
     model.learn(total_timesteps=total_steps, callback=[best_cb, periodic_cb], tb_log_name=run_id)
 
+    # Save final
     final_path = os.path.join(ckpt_dir, "final")
     model.save(final_path)
     print(f"✅ Saved final checkpoint: {final_path}.zip")
 
+    # Report evaluation (best checkpoint)
     best_path = os.path.join(ckpt_dir, "best_by_success.zip")
     if os.path.exists(best_path):
         best_model = SAC.load(best_path)
-        sr500 = eval_success_rate(best_model, episodes=500, seed=seed + 999, horizon=horizon, control_freq=control_freq, reward_shaping=reward_shaping)
+        sr500 = eval_success_rate(
+            best_model,
+            episodes=500,
+            seed=seed + 999,
+            horizon=horizon,
+            control_freq=control_freq,
+            reward_shaping=reward_shaping,
+            nominal_confounded=nominal_confounded,
+            spurious_seed=seed + 999,
+        )
         print(f"✅ Best checkpoint success_rate over 500 eps: {sr500:.3f}")
 
         with open(os.path.join(run_dir, "eval_report.txt"), "w") as f:
             f.write(f"Best checkpoint: {best_path}\n")
             f.write(f"SR over 500 eps: {sr500:.6f}\n")
     else:
-        print("⚠️ Could not find best_by_success.zip to evaluate.")
+        print("⚠️ Could not find best_by_success.zip to evaluate. (Did callback save correctly?)")
 
     train_env.close()
     eval_env.close()
