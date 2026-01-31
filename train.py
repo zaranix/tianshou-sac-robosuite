@@ -4,6 +4,12 @@
 #   - state-based obs (use_camera_obs=False)
 #   - appends RGB (3 dims) to obs so the agent can "see" color without pixels
 #   - forces OSC_POSITION controller so action_dim should be 4 (paper-like)
+#
+# Requires:
+#   - success.py containing SuccessInfoWrapper (your working version)
+#   - spurious_lift.py containing:
+#       - RobosuiteColorPosWrapper(env, mode=..., seed=...)
+#       - AppendRGBObsWrapper(gym_env)
 
 import os
 import json
@@ -63,8 +69,9 @@ def make_env(
     horizon: int = 300,
     control_freq: int = 20,
     reward_shaping: bool = True,
-    nominal_confounded: bool = False,  # if True: left->green, right->red + RGB appended
-    spurious_seed: int = 0,            # randomness for confounder sampling
+    nominal_confounded: bool = False,
+    spurious_seed: int = 0,
+    spurious_mode: str = "confounded",  # "confounded" or "shifted_..." depending on your wrapper
 ) -> Monitor:
     """
     Returns a Gymnasium-style env for SB3:
@@ -76,16 +83,15 @@ def make_env(
       - state-based obs (use_camera_obs=False)
       - optional: inject nominal spurious correlation (pos<->color) and append RGB to obs
     """
-    # ✅ Force OSC_POSITION (paper-like); if this isn't applied you'll get act_dim=7
-    # Load BASIC controller and modify to use OSC_POSITION (3D position control only)
+    # Force OSC_POSITION (paper-like)
     from robosuite.controllers import load_composite_controller_config
-    
+
     controller_cfg = load_composite_controller_config(controller="BASIC", robot="Panda")
-    # Modify the right arm controller from OSC_POSE (6D) to OSC_POSITION (3D)
+
+    # Modify right arm controller to OSC_POSITION (3D position control only)
     controller_cfg["body_parts"]["right"]["type"] = "OSC_POSITION"
     controller_cfg["body_parts"]["right"]["output_max"] = [0.05, 0.05, 0.05]
     controller_cfg["body_parts"]["right"]["output_min"] = [-0.05, -0.05, -0.05]
-    # Remove orientation-related keys that aren't needed for OSC_POSITION
     controller_cfg["body_parts"]["right"].pop("orientation_limits", None)
     controller_cfg["body_parts"]["right"].pop("uncouple_pos_ori", None)
 
@@ -101,15 +107,15 @@ def make_env(
         reward_shaping=reward_shaping,
     )
 
-    # ✅ Inject spurious correlation at robosuite level BEFORE GymWrapper
+    # Inject spurious correlation BEFORE GymWrapper (robosuite-level)
     if nominal_confounded:
         from spurious_lift import RobosuiteColorPosWrapper
-        env = RobosuiteColorPosWrapper(env, mode="confounded", seed=spurious_seed)
+        env = RobosuiteColorPosWrapper(env, mode=spurious_mode, seed=spurious_seed)
 
     # Convert to Gymnasium
     env = GymWrapper(env)
 
-    # ✅ Append RGB to obs so agent can use color without pixels
+    # Append RGB to obs so agent can use color without pixels
     if nominal_confounded:
         from spurious_lift import AppendRGBObsWrapper
         env = AppendRGBObsWrapper(env)
@@ -207,6 +213,7 @@ def eval_success_rate(
     reward_shaping: bool = True,
     nominal_confounded: bool = False,
     spurious_seed: int = 0,
+    spurious_mode: str = "confounded",
 ) -> float:
     env = make_env(
         seed=seed,
@@ -215,6 +222,7 @@ def eval_success_rate(
         reward_shaping=reward_shaping,
         nominal_confounded=nominal_confounded,
         spurious_seed=spurious_seed,
+        spurious_mode=spurious_mode,
     )
 
     succ = 0.0
@@ -240,10 +248,12 @@ def main():
     # ======== EXPERIMENT SETTINGS ========
     seed = 0
 
-    # For nominal-confounded run (paper Figure 11 col 1): set True
+    # Nominal-confounded run: left->green, right->red + RGB appended
     nominal_confounded = True
+    spurious_mode = "confounded"   # nominal
+    spurious_seed = seed
 
-    # Steps: start with 2M (your baseline got ~0.998 at 2M)
+    # Use 2M for parity with your strong baseline
     total_steps = 2_000_000
 
     # Env protocol
@@ -289,7 +299,8 @@ def main():
         control_freq=control_freq,
         reward_shaping=reward_shaping,
         nominal_confounded=nominal_confounded,
-        spurious_seed=seed,
+        spurious_seed=spurious_seed,
+        spurious_mode=spurious_mode,
     )
     eval_env = make_env(
         seed=seed + 1,
@@ -297,7 +308,8 @@ def main():
         control_freq=control_freq,
         reward_shaping=reward_shaping,
         nominal_confounded=nominal_confounded,
-        spurious_seed=seed + 1,
+        spurious_seed=spurious_seed + 1,
+        spurious_mode=spurious_mode,
     )
 
     obs_dim, act_dim = get_obs_act_dims(train_env)
@@ -327,6 +339,8 @@ def main():
             "nominal_spurious": (
                 "left->green, right->red; RGB appended to obs" if nominal_confounded else "none"
             ),
+            "spurious_mode": spurious_mode,
+            "spurious_seed": spurious_seed,
         },
         "algo": {"name": "SAC", "library": "stable-baselines3", **sac_kwargs},
         "eval": {"eval_freq": eval_freq, "eval_episodes": eval_episodes, "report_eval_episodes": 500},
@@ -385,6 +399,7 @@ def main():
             reward_shaping=reward_shaping,
             nominal_confounded=nominal_confounded,
             spurious_seed=seed + 999,
+            spurious_mode=spurious_mode,
         )
         print(f"✅ Best checkpoint success_rate over 500 eps: {sr500:.3f}")
 
